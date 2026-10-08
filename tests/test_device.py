@@ -858,6 +858,49 @@ async def test_gateway_receives_fragmented_frames_without_shortening_timeout(
         reader.close()
 
 
+@pytest.mark.parametrize("push_cid", ["cid-a", "cid-b"])
+async def test_gateway_initial_refresh_preserves_interleaved_scene_reports(
+    transport_gateway, gateway_scene_events, mocker, push_cid
+):
+    """Setting up a child cannot swallow reports from an active gateway."""
+    parent, a, b = transport_gateway
+    trigger_a, trigger_b = gateway_scene_events
+    trigger = trigger_a if push_cid == a.dev_cid else trigger_b
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(1)
+    peer.settimeout(1)
+    query = mocker.spy(b._api, "status")
+    finished = asyncio.Event()
+    trigger.side_effect = lambda *_: finished.set() if trigger.call_count == 2 else None
+    refresh = asyncio.create_task(b.async_refresh())
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        receiver.start(a)
+        await asyncio.sleep(0)
+        assert receiver.lock.locked()
+        peer.sendall(
+            gateway_frame(parent, {"1": "scene"}, 4, cid=push_cid, sequence=76171)
+            + gateway_frame(parent, {"1": "scene"}, 4, cid=push_cid, sequence=76174)
+            + gateway_frame(parent, {"24": True}, cid=b.dev_cid)
+        )
+        await asyncio.wait_for(refresh, 1)
+        await asyncio.wait_for(finished.wait(), 0.5)
+        assert trigger.call_count == 2
+        (trigger_b if push_cid == a.dev_cid else trigger_a).assert_not_called()
+        assert b.get_property("24") is True
+        query.assert_called_once()
+        assert parent.received_wrong_cid_queue == []
+    finally:
+        peer.close()
+        await asyncio.gather(refresh, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["status", "updatedps"])
 @pytest.mark.parametrize("persistent", [False, True])

@@ -854,10 +854,16 @@ class TuyaLocalDevice(object):
     async def async_refresh(self):
         _LOGGER.debug("Refreshing device state for %s", self.name)
         if not self._running:
-            await self._retry_on_failed_connection(
-                lambda: self._refresh_cached_state(),
-                f"Failed to refresh device state for {self.name}.",
-            )
+            error_message = f"Failed to refresh device state for {self.name}."
+            if self._gateway_receiver:
+                new_state = await self._poll_with_gateway_pushes(
+                    self._api.status, error_message
+                )
+                self._cache_refreshed_state(new_state)
+            else:
+                await self._retry_on_failed_connection(
+                    self._refresh_cached_state, error_message
+                )
 
     def get_property(self, dps_id):
         cached_state = self._get_cached_state()
@@ -884,7 +890,10 @@ class TuyaLocalDevice(object):
         self._last_full_poll = 0
 
     def _refresh_cached_state(self):
-        new_state = self._api.status()
+        return self._cache_refreshed_state(self._api.status())
+
+    def _cache_refreshed_state(self, new_state):
+        """Apply an initial status reply after the gateway transaction completes."""
         if new_state:
             if "Err" not in new_state:
                 self._cached_state = self._cached_state | new_state.get("dps", {})
