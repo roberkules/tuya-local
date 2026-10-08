@@ -685,7 +685,7 @@ async def async_test_connection(config: dict, hass: HomeAssistant):
     existing = domain_data.get(get_device_id(config)) if domain_data else None
     if existing and existing.get("device"):
         _LOGGER.info("Pausing existing device to test new connection parameters")
-        existing["device"].pause()
+        await existing["device"].async_pause()
         await asyncio.sleep(5)
 
     retval = None

@@ -448,7 +448,7 @@ async def test_async_test_connection_valid(hass, mocker):
     )
     mock_instance = mocker.AsyncMock()
     mock_instance.has_returned_state = True
-    mock_instance.pause = mocker.MagicMock()
+    mock_instance.async_pause = mocker.AsyncMock()
     mock_instance.resume = mocker.MagicMock()
     mock_device.return_value = mock_instance
     hass.data[DOMAIN] = {"deviceid": {"device": mock_instance}}
@@ -463,7 +463,7 @@ async def test_async_test_connection_valid(hass, mocker):
         hass,
     )
     assert device == mock_instance
-    mock_instance.pause.assert_called_once()
+    mock_instance.async_pause.assert_awaited_once()
     mock_instance.resume.assert_called_once()
 
 
@@ -475,7 +475,7 @@ async def test_async_test_connection_for_subdevice_valid(hass, mocker):
     )
     mock_instance = mocker.AsyncMock()
     mock_instance.has_returned_state = True
-    mock_instance.pause = mocker.MagicMock()
+    mock_instance.async_pause = mocker.AsyncMock()
     mock_instance.resume = mocker.MagicMock()
     mock_device.return_value = mock_instance
     hass.data[DOMAIN] = {"deviceid/subdeviceid": {"device": mock_instance}}
@@ -491,7 +491,7 @@ async def test_async_test_connection_for_subdevice_valid(hass, mocker):
         hass,
     )
     assert device == mock_instance
-    mock_instance.pause.assert_called_once()
+    mock_instance.async_pause.assert_awaited_once()
     mock_instance.resume.assert_called_once()
 
 
