@@ -27,7 +27,12 @@ from .const import (
     CONF_TYPE,
     DOMAIN,
 )
-from .device import async_delete_device, get_device_id, setup_device
+from .device import (
+    async_delete_device,
+    cleanup_failed_device,
+    get_device_id,
+    setup_device,
+)
 from .discovery import async_start_discovery, async_stop_discovery
 from .helpers.device_config import get_config
 from .services import async_setup_services
@@ -72,20 +77,6 @@ def get_device_unique_id(entry: ConfigEntry):
         or entry.data.get(CONF_DEVICE_CID)
         or entry.data.get(CONF_DEVICE_ID)
     )
-
-
-def cleanup_failed_device(hass: HomeAssistant, device_id: str):
-    """Drop cached device objects left behind by failed setup."""
-    domain_data = hass.data.get(DOMAIN, {})
-    stale = domain_data.pop(device_id, None)
-    if not stale:
-        return
-
-    api = stale.get("tuyadevice")
-    if api:
-        api.set_socketPersistent(False)
-        if api.parent:
-            api.parent.set_socketPersistent(False)
 
 
 async def async_migrate_entry(hass, entry: ConfigEntry):
@@ -1103,11 +1094,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await device.async_refresh()
 
     except Exception as e:
-        cleanup_failed_device(hass, device_id)
+        await hass.async_add_executor_job(
+            cleanup_failed_device, hass, device_id, config[CONF_DEVICE_ID]
+        )
         raise ConfigEntryNotReady("tuya-local device not ready") from e
 
     if not device.has_returned_state:
-        cleanup_failed_device(hass, device_id)
+        await hass.async_add_executor_job(
+            cleanup_failed_device, hass, device_id, config[CONF_DEVICE_ID]
+        )
         raise ConfigEntryNotReady("tuya-local device offline")
 
     device_conf = await hass.async_add_executor_job(
@@ -1157,7 +1152,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
         await hass.config_entries.async_forward_entry_unload(entry, e)
 
     await async_delete_device(hass, config)
-    domain_data.pop(device_id, None)
+    if not domain_data.get(device_id, {}).get("gateway_receiver"):
+        domain_data.pop(device_id, None)
 
     # Stop the shared rediscovery sweeper once the last device is gone.
     remaining = [

@@ -15,6 +15,7 @@ from custom_components.tuya_local.event import (
     TuyaLocalEvent,
     async_setup_entry,
 )
+from custom_components.tuya_local.helpers.device_config import get_config
 
 
 @pytest.mark.asyncio
@@ -88,3 +89,38 @@ async def test_init_entry_fails_if_config_is_missing(hass):
     except ValueError:
         pass
     m_add_entities.assert_not_called()
+
+
+def test_repeated_identical_pushes_trigger_distinct_events(mocker):
+    """Repeated button presses must not be deduplicated as state updates."""
+    config = get_config("linkoze_dual_button")
+    event_config = next(e for e in config.all_entities() if e.entity == "event")
+    device = mocker.MagicMock()
+    device.get_property.return_value = "single_click"
+    event = TuyaLocalEvent(device, event_config)
+    trigger = mocker.patch.object(event, "_trigger_event")
+
+    event.on_receive({"1": "single_click"}, False)
+    event.on_receive({"1": "single_click"}, False)
+    event.on_receive({"1": "single_click"}, True)
+
+    assert trigger.call_count == 2
+
+
+def test_poll_values_never_trigger_events(mocker):
+    """Neither an initial nor a changed polled event value is a new press."""
+    config = get_config("linkoze_dual_button")
+    event_config = next(e for e in config.all_entities() if e.entity == "event")
+    device = mocker.MagicMock()
+    event = TuyaLocalEvent(device, event_config)
+    trigger = mocker.patch.object(event, "_trigger_event")
+
+    for value in ("single_click", "double_click", None, "single_click"):
+        device.get_property.return_value = value
+        event.on_receive({"1": value}, True)
+    trigger.assert_not_called()
+
+    device.get_property.return_value = "single_click"
+    event.on_receive({"1": "single_click"}, False)
+    event.on_receive({"1": "single_click"}, False)
+    assert trigger.call_count == 2
