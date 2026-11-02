@@ -2666,19 +2666,23 @@ async def test_gateway_ack_backlog_is_drained_without_idle_delays(
         reader.close()
 
 
-@pytest.mark.parametrize("close_peer", [False, True])
+@pytest.mark.parametrize("socket_state", ["idle", "closed", "nonpersistent"])
 async def test_gateway_idle_or_closed_socket_does_not_spin(
-    transport_gateway, mocker, close_peer
+    transport_gateway, mocker, socket_state
 ):
     """Fast ACK draining must retain idle backoff and not reopen closed sockets."""
     parent, a, b = transport_gateway
     receiver = b._gateway_receiver
     reader, peer = socket.socketpair()
+    parent.set_socketPersistent(socket_state != "nonpersistent")
     parent.socket = reader
-    parent.set_socketPersistent(True)
     parent.set_socketTimeout(5)
-    if close_peer:
+    if socket_state == "closed":
         peer.close()
+    elif socket_state == "nonpersistent":
+        # A connection being negotiated is not owned by the unsolicited
+        # reader, even when input is buffered on it.
+        peer.sendall(gateway_frame(parent, {"1": "scene"}, 4))
     receive = mocker.spy(parent, "receive")
     idle = asyncio.Event()
     wait = receiver._wait
@@ -2693,7 +2697,7 @@ async def test_gateway_idle_or_closed_socket_does_not_spin(
     try:
         await asyncio.wait_for(idle.wait(), 1)
         assert waits.call_args == mocker.call(0.1)
-        if close_peer:
+        if socket_state == "closed":
             receive.assert_called_once()
             assert parent.socket is None
         else:
