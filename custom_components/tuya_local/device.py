@@ -95,6 +95,9 @@ class _GatewayReceiver:
         self.task = None
         self._stopping = False
         self._wake = asyncio.Event()
+        self.pending_writes = 0
+        self.writes_done = asyncio.Event()
+        self.writes_done.set()
 
     def start(self, device):
         self.devices[device.dev_cid] = device
@@ -983,10 +986,21 @@ class TuyaLocalDevice(object):
             log_json(pending_properties),
         )
 
-        await self._retry_on_failed_connection(
-            lambda: self._set_values(pending_properties),
-            "Failed to update device state.",
-        )
+        receiver = self._gateway_receiver
+        if receiver:
+            receiver.pending_writes += 1
+            receiver.writes_done.clear()
+        try:
+            await self._retry_on_failed_connection(
+                lambda: self._set_values(pending_properties),
+                "Failed to update device state.",
+                priority=True,
+            )
+        finally:
+            if receiver:
+                receiver.pending_writes -= 1
+                if not receiver.pending_writes:
+                    receiver.writes_done.set()
 
     def _set_values(self, properties):
         self._api.set_multiple_values(properties, nowait=True)
@@ -1062,7 +1076,32 @@ class TuyaLocalDevice(object):
                 reply.delivered = True
         return reply
 
-    async def _retry_on_failed_connection(self, func, error_message):
+    async def _call_api_with_lock(self, func, *, priority=False):
+        """Give pending commands a turn before queued gateway polls."""
+        receiver = self._gateway_receiver
+        while True:
+            if receiver and not priority:
+                await receiver.writes_done.wait()
+            async with self._api_lock:
+                # Polls already queued on the lock yield before sending a query.
+                if receiver and not priority and receiver.pending_writes:
+                    continue
+                if receiver:
+                    read = asyncio.ensure_future(
+                        self._hass.async_add_executor_job(func)
+                    )
+                    try:
+                        return await asyncio.shield(read)
+                    except CancelledError:
+                        # The executor must finish using the shared socket
+                        # before the receiver can acquire its lock.
+                        try:
+                            await read
+                        finally:
+                            raise
+                return await self._hass.async_add_executor_job(func)
+
+    async def _retry_on_failed_connection(self, func, error_message, *, priority=False):
         if self._api_protocol_version_index is None:
             await self._rotate_api_protocol_version()
         auto = (self._protocol_configured == "auto") and (
@@ -1084,22 +1123,7 @@ class TuyaLocalDevice(object):
         for i in range(connections):
             try:
                 if not self._hass.is_stopping:
-                    async with self._api_lock:
-                        if self._gateway_receiver:
-                            read = asyncio.ensure_future(
-                                self._hass.async_add_executor_job(func)
-                            )
-                            try:
-                                retval = await asyncio.shield(read)
-                            except CancelledError:
-                                # The executor must finish using the shared socket
-                                # before the receiver can acquire its lock.
-                                try:
-                                    await read
-                                finally:
-                                    raise
-                        else:
-                            retval = await self._hass.async_add_executor_job(func)
+                    retval = await self._call_api_with_lock(func, priority=priority)
                     if isinstance(retval, dict) and "Error" in retval:
                         last_err_code = retval.get("Err")
                         last_err_msg = retval.get("Error")

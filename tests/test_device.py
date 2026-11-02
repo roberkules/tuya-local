@@ -2501,3 +2501,137 @@ async def test_concurrent_gateway_child_polls_preserve_ten_rapid_presses(
         await receiver.stop(a)
         await receiver.stop(b)
         reader.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_write_runs_before_queued_child_polls(
+    transport_gateway, patched_hass, mocker
+):
+    """A command may not wait for every child in a synchronized poll burst."""
+    _, a, b = transport_gateway
+    a._api_protocol_version_index = 0
+    a._api_protocol_working = True
+    order = []
+    poll_started = asyncio.Event()
+    release_poll = asyncio.Event()
+
+    def first_poll():
+        order.append("in-flight poll")
+
+    async def executor_job(func, *args):
+        if func is first_poll:
+            poll_started.set()
+            await release_poll.wait()
+        return func(*args)
+
+    mocker.patch.object(
+        patched_hass, "async_add_executor_job", side_effect=executor_job
+    )
+    in_flight = asyncio.create_task(
+        a._retry_on_failed_connection(first_poll, "poll failed")
+    )
+    await poll_started.wait()
+    queued = [
+        asyncio.create_task(
+            device._retry_on_failed_connection(
+                lambda index=index: order.append(f"queued poll {index}"),
+                "poll failed",
+            )
+        )
+        for index, device in enumerate((a, b, a, b))
+    ]
+    await asyncio.sleep(0)
+    b._pending_updates = {"25": {"value": True, "updated_at": time(), "sent": False}}
+    mocker.patch.object(b, "_set_values", side_effect=lambda _: order.append("write"))
+    write = asyncio.create_task(b._send_pending_updates())
+    await asyncio.sleep(0)
+    assert b._gateway_receiver.pending_writes == 1
+
+    release_poll.set()
+    await asyncio.gather(in_flight, write, *queued)
+
+    assert order == [
+        "in-flight poll",
+        "write",
+        "queued poll 0",
+        "queued poll 1",
+        "queued poll 2",
+        "queued poll 3",
+    ]
+    assert b._gateway_receiver.pending_writes == 0
+    assert b._gateway_receiver.writes_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gateway_write_releases_waiting_polls(
+    transport_gateway, mocker
+):
+    """A cancelled command must not leave polling suspended."""
+    _, a, b = transport_gateway
+    a._api_protocol_version_index = b._api_protocol_version_index = 0
+    a._api_protocol_working = b._api_protocol_working = True
+    receiver = b._gateway_receiver
+    b._pending_updates = {"25": {"value": True, "updated_at": time(), "sent": False}}
+    mocker.patch.object(b, "_set_values")
+
+    await receiver.lock.acquire()
+    write = asyncio.create_task(b._send_pending_updates())
+    await asyncio.sleep(0)
+    assert receiver.pending_writes == 1
+    poll = asyncio.create_task(
+        a._retry_on_failed_connection(lambda: None, "poll failed")
+    )
+    write.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    assert receiver.pending_writes == 0
+    assert receiver.writes_done.is_set()
+
+    receiver.lock.release()
+    await asyncio.wait_for(poll, 1)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_gateway_write_keeps_polls_waiting_after_cancellation(
+    transport_gateway, patched_hass, mocker
+):
+    """Cancellation cannot release the gateway lock before its send finishes."""
+    _, a, b = transport_gateway
+    a._api_protocol_version_index = b._api_protocol_version_index = 0
+    a._api_protocol_working = b._api_protocol_working = True
+    receiver = b._gateway_receiver
+    b._pending_updates = {"25": {"value": True, "updated_at": time(), "sent": False}}
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order = []
+
+    def send(_):
+        order.append("write")
+
+    mocker.patch.object(b, "_set_values", side_effect=send)
+
+    async def executor_job(func, *args):
+        if not started.is_set():
+            started.set()
+            await release.wait()
+        return func(*args)
+
+    mocker.patch.object(
+        patched_hass, "async_add_executor_job", side_effect=executor_job
+    )
+    write = asyncio.create_task(b._send_pending_updates())
+    await started.wait()
+    poll = asyncio.create_task(
+        a._retry_on_failed_connection(lambda: order.append("poll"), "poll failed")
+    )
+    write.cancel()
+    await asyncio.sleep(0)
+    assert receiver.pending_writes == 1
+    assert order == []
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    await asyncio.wait_for(poll, 1)
+    assert order == ["write", "poll"]
+    assert receiver.writes_done.is_set()
