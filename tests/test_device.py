@@ -26,6 +26,7 @@ from custom_components.tuya_local.const import (
 from custom_components.tuya_local.device import (
     TuyaLocalDevice,
     _GatewayPacket,
+    _receive_available,
     async_delete_device,
     setup_device,
 )
@@ -2498,6 +2499,209 @@ async def test_concurrent_gateway_child_polls_preserve_ten_rapid_presses(
     finally:
         peer.close()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+@pytest.mark.parametrize("retry", [True, False])
+async def test_gateway_empty_ack_releases_lock_for_command(
+    transport_gateway, mocker, retry
+):
+    """A complete ACK cannot hold a queued write until the socket timeout."""
+    parent, a, b = transport_gateway
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(5)
+    parent.set_retry(retry)
+    entered = ThreadEvent()
+    release = ThreadEvent()
+    receive = parent._receive
+
+    def receive_frame():
+        entered.set()
+        assert release.wait(1)
+        return receive()
+
+    frame_read = mocker.patch.object(parent, "_receive", side_effect=receive_frame)
+    ack = pack_message(
+        TuyaMessage(1, CT.CONTROL_NEW, 0, b"\x00\x00\x00\x00", 0),
+        hmac_key=parent.local_key,
+    )
+    peer.sendall(ack)
+    receiver = b._gateway_receiver
+    receiver.start(b)
+    command = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        command = asyncio.create_task(b.async_set_property("24", True))
+        await asyncio.sleep(0.02)
+        assert receiver.lock.locked()
+        assert receiver.lock._waiters
+        release.set()
+        await asyncio.wait_for(asyncio.shield(command), 0.5)
+        peer.settimeout(0.5)
+        assert await asyncio.to_thread(peer.recv, 4096)
+        assert frame_read.call_count == 1
+        assert parent.retry is retry
+        assert reader.gettimeout() == parent.connection_timeout == 5
+    finally:
+        release.set()
+        peer.close()
+        if command and not command.done():
+            command.cancel()
+            await asyncio.gather(command, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+async def test_gateway_ack_preserves_two_identical_scene_reports(
+    transport_gateway, gateway_scene_events, mocker
+):
+    """Stopping at an ACK leaves both following real reports for the owner."""
+    parent, a, b = transport_gateway
+    trigger_a, trigger_b = gateway_scene_events
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(5)
+    delivered = asyncio.Event()
+    trigger_b.side_effect = lambda *_: (
+        delivered.set() if trigger_b.call_count == 2 else None
+    )
+    ack = pack_message(
+        TuyaMessage(1, CT.CONTROL_NEW, 0, b"\x00\x00\x00\x00", 0),
+        hmac_key=parent.local_key,
+    )
+    peer.sendall(ack + gateway_frame(parent, {"1": "scene"}, 4) * 2)
+    receiver = b._gateway_receiver
+    receiver.start(b)
+    try:
+        await asyncio.wait_for(delivered.wait(), 1)
+        trigger_a.assert_not_called()
+        assert trigger_b.call_args_list == [
+            mocker.call("pressed", mocker.ANY),
+            mocker.call("pressed", mocker.ANY),
+        ]
+        assert parent.retry is True
+    finally:
+        peer.close()
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+def test_gateway_single_frame_read_restores_retry_after_exception(mocker):
+    """Temporary unsolicited-read policy cannot leak into polling or writes."""
+    parent = mocker.MagicMock()
+    parent.parent = None
+    parent.retry = True
+    parent.receive.side_effect = RuntimeError("read failed")
+    selector = mocker.patch("custom_components.tuya_local.device.DefaultSelector")
+    selector.return_value.__enter__.return_value.select.return_value = [True]
+    with pytest.raises(RuntimeError, match="read failed"):
+        _receive_available(parent, True)
+    assert parent.set_retry.call_args_list == [mocker.call(False), mocker.call(True)]
+
+
+@pytest.mark.parametrize("command", [CT.HEART_BEAT, CT.CONTROL_NEW])
+@pytest.mark.parametrize("retry", [True, False])
+async def test_gateway_ack_backlog_is_drained_without_idle_delays(
+    transport_gateway, gateway_scene_events, mocker, command, retry
+):
+    """Buffered ACKs cannot add 100ms each before another child's report."""
+    parent, a, b = transport_gateway
+    trigger_a, trigger_b = gateway_scene_events
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(5)
+    parent.set_retry(retry)
+    completed = asyncio.Event()
+    premature_idle = []
+    wait = receiver._wait
+
+    async def record_wait(delay):
+        if delay and not completed.is_set():
+            premature_idle.append(delay)
+        await wait(delay)
+
+    mocker.patch.object(receiver, "_wait", side_effect=record_wait)
+    state = mocker.MagicMock()
+    state.on_receive.side_effect = lambda dps, _: (
+        completed.set() if "24" in dps else None
+    )
+    b._children.append(state)
+    ack = pack_message(
+        TuyaMessage(1, command, 0, b"\x00\x00\x00\x00", 0),
+        hmac_key=parent.local_key,
+    )
+    peer.sendall(
+        ack * 15
+        + gateway_frame(parent, {"1": "scene"}, 4, sequence=1)
+        + gateway_frame(parent, {"1": "scene"}, 4, sequence=2)
+        + gateway_frame(parent, {"1": "scene"}, 4, cid=a.dev_cid, sequence=3)
+        + gateway_frame(parent, {"1": "scene", "24": True}, nested=False)
+    )
+    receiver.start(a)
+    receiver.start(b)
+    try:
+        await asyncio.wait_for(completed.wait(), 3)
+        assert premature_idle == []
+        trigger_a.assert_called_once_with("pressed", mocker.ANY)
+        assert trigger_b.call_args_list == [
+            mocker.call("pressed", mocker.ANY),
+            mocker.call("pressed", mocker.ANY),
+        ]
+        assert b.get_property("24") is True
+        assert reader.gettimeout() == parent.connection_timeout == 5
+        assert parent.retry is retry
+    finally:
+        peer.close()
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+@pytest.mark.parametrize("close_peer", [False, True])
+async def test_gateway_idle_or_closed_socket_does_not_spin(
+    transport_gateway, mocker, close_peer
+):
+    """Fast ACK draining must retain idle backoff and not reopen closed sockets."""
+    parent, a, b = transport_gateway
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(5)
+    if close_peer:
+        peer.close()
+    receive = mocker.spy(parent, "receive")
+    idle = asyncio.Event()
+    wait = receiver._wait
+
+    async def record_wait(delay):
+        if delay:
+            idle.set()
+        await wait(delay)
+
+    waits = mocker.patch.object(receiver, "_wait", side_effect=record_wait)
+    receiver.start(b)
+    try:
+        await asyncio.wait_for(idle.wait(), 1)
+        assert waits.call_args == mocker.call(0.1)
+        if close_peer:
+            receive.assert_called_once()
+            assert parent.socket is None
+        else:
+            receive.assert_not_called()
+            assert reader.gettimeout() == 5
+        assert parent.retry is True
+    finally:
+        peer.close()
         await receiver.stop(a)
         await receiver.stop(b)
         reader.close()

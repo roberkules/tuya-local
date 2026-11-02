@@ -61,15 +61,32 @@ def _collect_possible_matches(cached_state, product_ids):
     return list(possible_matches(cached_state, product_ids))
 
 
-def _receive_available(api):
-    """Read available data without shortening TinyTuya's frame timeout."""
+def _socket_readable(api):
+    """Check for buffered input without waiting for a frame."""
     wifi_api = api.parent or api
     if not wifi_api.socket:
-        return None
+        return False
     with DefaultSelector() as selector:
         selector.register(wifi_api.socket, EVENT_READ)
-        ready = selector.select(timeout=0)
-    return api.receive() if ready else None
+        return bool(selector.select(timeout=0))
+
+
+def _receive_available(api, single_frame=False):
+    """Read available data without shortening TinyTuya's frame timeout."""
+    if not _socket_readable(api):
+        return None
+    if not single_frame:
+        return api.receive()
+    # A complete empty ACK must not start another blocking receive while
+    # unsolicited reception holds the gateway lock. Keep the full socket
+    # timeout for the current frame, including fragmented frames.
+    wifi_api = api.parent or api
+    retry = wifi_api.retry
+    wifi_api.set_retry(False)
+    try:
+        return api.receive()
+    finally:
+        wifi_api.set_retry(retry)
 
 
 class _GatewayPacket(dict):
@@ -269,7 +286,7 @@ class _GatewayReceiver:
                         if self.parent.socket and self.parent.socketPersistent:
                             read = asyncio.ensure_future(
                                 self.hass.async_add_executor_job(
-                                    self.read, _receive_available, self.parent
+                                    self.read, _receive_available, self.parent, True
                                 )
                             )
                             try:
@@ -280,7 +297,11 @@ class _GatewayReceiver:
                                 await read
                                 raise
                         self.dispatch(packet)
-                    await self._wait(0 if packet else 0.1)
+                        # Empty ACKs return None too. Drain buffered frames
+                        # before idling, releasing the lock after each frame
+                        # so waiting commands and polls still get a turn.
+                        buffered = not packet and _socket_readable(self.parent)
+                    await self._wait(0 if packet or buffered else 0.1)
                 except Exception:
                     _LOGGER.exception("Gateway receive error")
                     await self.disconnect()
