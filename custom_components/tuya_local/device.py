@@ -303,7 +303,11 @@ class _GatewayReceiver:
                         # Empty ACKs return None too. Drain buffered frames
                         # before idling, releasing the lock after each frame
                         # so waiting commands and polls still get a turn.
-                        buffered = not packet and _socket_readable(self.parent)
+                        buffered = (
+                            not packet
+                            and self.parent.socketPersistent
+                            and _socket_readable(self.parent)
+                        )
                     await self._wait(0 if packet or buffered else 0.1)
                 except Exception:
                     _LOGGER.exception("Gateway receive error")
