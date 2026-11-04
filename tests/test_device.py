@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import select
 import socket
 from threading import Event as ThreadEvent
 from time import sleep as blocking_sleep
@@ -34,6 +35,238 @@ from custom_components.tuya_local.event import TuyaLocalEvent
 from custom_components.tuya_local.helpers.device_config import get_config
 
 from .const import EUROM_600_HEATER_PAYLOAD
+
+
+@pytest.mark.parametrize("method", ["status", "updatedps"])
+@pytest.mark.parametrize(
+    ("command", "retcode"),
+    [(CT.DP_QUERY_NEW, 0), (CT.UPDATEDPS, 0), (CT.HEART_BEAT, 1), (99, 0)],
+)
+async def test_gateway_poll_preserves_other_empty_reply_handling(
+    transport_gateway, mocker, method, command, retcode
+):
+    """Do not reinterpret a poll ACK, error ACK or unknown frame as a heartbeat."""
+    parent, _, b = transport_gateway
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(0.5)
+    parent.set_retry(False)
+    receive = mocker.spy(parent, "_receive")
+    query = mocker.spy(b._api, method)
+    peer.sendall(
+        pack_message(
+            TuyaMessage(1, command, retcode, retcode.to_bytes(4, "big"), 0),
+            hmac_key=parent.local_key,
+        )
+    )
+    poll = b._api.status if method == "status" else lambda: b._api.updatedps([24])
+    try:
+        assert await b._poll_with_gateway_pushes(poll, "poll failed") is None
+        receive.assert_called_once()
+        query.assert_called_once()
+        assert parent._receive is receive
+        assert b._api_working_protocol_failures == 0
+    finally:
+        parent.set_socketPersistent(False)
+        peer.close()
+
+
+@pytest.mark.parametrize("command", [CT.HEART_BEAT, CT.CONTROL_NEW])
+async def test_gateway_poll_keeps_data_in_heartbeat_or_control_frames(
+    transport_gateway, mocker, command
+):
+    """Skip only empty ACKs; real payloads retain TinyTuya's existing handling."""
+    parent, _, b = transport_gateway
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(0.5)
+    receive = mocker.spy(parent, "_receive")
+    peer.sendall(gateway_frame(parent, {"24": False}, command=command, nested=False))
+    try:
+        reply = await b._poll_with_gateway_pushes(b._api.status, "poll failed")
+        assert reply["dps"] == {"24": False}
+        receive.assert_called_once()
+        assert parent._receive is receive
+    finally:
+        parent.set_socketPersistent(False)
+        peer.close()
+
+
+def test_gateway_poll_ack_flood_is_bounded_and_hooks_are_restored(
+    transport_gateway, mocker
+):
+    """A stream of irrelevant ACKs must not monopolise the shared connection."""
+    parent, _, b = transport_gateway
+    parent.set_socketTimeout(1)
+    receive = mocker.patch.object(
+        parent, "_receive", return_value=TuyaMessage(1, CT.HEART_BEAT, 0, b"", 0)
+    )
+    decode = parent._decode_payload
+    mocker.patch(
+        "custom_components.tuya_local.device.monotonic", side_effect=[0, 0.25, 1.1]
+    )
+    with pytest.raises(TimeoutError, match="only unrelated ACKs"):
+        b._gateway_receiver.read_poll(lambda: parent._receive())
+    assert receive.call_count == 2
+    assert parent._receive is receive
+    assert parent._decode_payload == decode
+    assert parent.connection_timeout == 1
+
+
+@pytest.mark.parametrize(
+    ("decoded", "classification", "version"),
+    [
+        (None, "error_type=TypeError", 3.4),
+        ({"local_key": "do-not-log-this-value"}, "result_type=dict", 3.4),
+        ("data unvalid", "result_type=NoneType", 3.3),
+    ],
+)
+async def test_gateway_decode_diagnostics_log_shape_without_payload_values(
+    transport_gateway, caplog, decoded, classification, version
+):
+    """Non-DPS/JSON-null responses need diagnostics without TinyTuya object reprs."""
+    parent, _, b = transport_gateway
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_version(version)
+    parent.disabledetect = False
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(0.5)
+    payload = AESCipher(parent.local_key).encrypt(json.dumps(decoded).encode(), False)
+    peer.sendall(
+        pack_message(
+            TuyaMessage(18314, CT.DP_QUERY_NEW, 0, b"\x00\x00\x00\x00" + payload, 0),
+            hmac_key=parent.local_key if version >= 3.4 else None,
+        )
+    )
+    try:
+        with caplog.at_level(
+            logging.DEBUG, logger="custom_components.tuya_local.device.routing"
+        ):
+            await asyncio.to_thread(b._gateway_receiver.read_poll, parent.receive)
+        # TinyTuya's own debug logger is independently enabled by the test
+        # environment. Check the new routing logger, which is safe to enable
+        # without enabling TinyTuya's payload/object-representation logging.
+        messages = "\n".join(
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "custom_components.tuya_local.device.routing"
+        )
+        assert "cmd=16 seq=18314" in messages
+        assert classification in messages
+        assert "do-not-log-this-value" not in messages
+        assert "0123456789abcdef" not in messages
+    finally:
+        parent.set_socketPersistent(False)
+        peer.close()
+
+
+@pytest.mark.parametrize("ack_count", [2, 15])
+async def test_gateway_initial_status_survives_heartbeat_ack_backlog(
+    transport_gateway, mocker, ack_count
+):
+    """An initializing child must consume its reply before becoming a receiver member."""
+    parent, a, b = transport_gateway
+    receiver = b._gateway_receiver
+    receiver.devices.pop(b.dev_cid)
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(0.5)
+    peer.settimeout(0.5)
+    query = mocker.spy(b._api, "status")
+    refresh = asyncio.create_task(b.async_refresh())
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        receiver.start(a)
+        await asyncio.sleep(0)
+        assert receiver.lock.locked()
+        ack = pack_message(
+            TuyaMessage(0, CT.HEART_BEAT, 0, b"\x00\x00\x00\x00", 0),
+            hmac_key=parent.local_key,
+        )
+        peer.sendall(
+            ack * ack_count + gateway_frame(parent, {"24": False}, cid=b.dev_cid)
+        )
+        await asyncio.wait_for(refresh, 1)
+        assert b.has_returned_state
+        assert b.get_property("24") is False
+        query.assert_called_once()
+        assert parent.received_wrong_cid_queue == []
+        assert not select.select([reader], [], [], 0)[0]
+        assert b.dev_cid not in receiver.devices
+    finally:
+        peer.close()
+        await asyncio.gather(refresh, return_exceptions=True)
+        await receiver.stop(a)
+        reader.close()
+
+
+@pytest.mark.parametrize("method", ["status", "updatedps"])
+@pytest.mark.parametrize("ack_command", [CT.HEART_BEAT, CT.CONTROL, CT.CONTROL_NEW])
+@pytest.mark.parametrize("retry", [False, True])
+async def test_gateway_poll_ignores_unrelated_acks_and_preserves_scene_reports(
+    transport_gateway, gateway_scene_events, mocker, method, ack_command, retry
+):
+    """ACKs cannot end a poll, let its reply escape, or suppress identical reports."""
+    parent, a, b = transport_gateway
+    trigger_a, trigger_b = gateway_scene_events
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(0.5)
+    parent.set_retry(retry)
+    peer.settimeout(0.5)
+    query = mocker.spy(b._api, method)
+    state = mocker.MagicMock()
+    b._children.append(state)
+    poll = b._api.status if method == "status" else lambda: b._api.updatedps([1, 24])
+    polling = asyncio.create_task(b._poll_with_gateway_pushes(poll, "poll failed"))
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        receiver.start(a)
+        receiver.start(b)
+        await asyncio.sleep(0)
+        assert receiver.lock.locked()
+        ack = pack_message(
+            TuyaMessage(0, ack_command, 0, b"\x00\x00\x00\x00", 0),
+            hmac_key=parent.local_key,
+        )
+        push = gateway_frame(parent, {"1": "scene"}, 4, sequence=parent.raw_sent.seqno)
+        snapshot = {"1": "scene", "24": True}
+        peer.sendall(
+            ack * 3
+            + push
+            + ack * 3
+            + push
+            + gateway_frame(
+                parent, snapshot, 4, command=CT.DP_QUERY_NEW, sequence=75729
+            )
+        )
+        reply = await asyncio.wait_for(polling, 1)
+        assert reply["data"]["dps"] == snapshot
+        b._handle_poll(snapshot, method == "status", from_poll=True)
+        assert state.on_receive.call_args_list == [
+            mocker.call({"1": "scene"}, False),
+            mocker.call({"1": "scene"}, False),
+            mocker.call(snapshot, True),
+        ]
+        assert trigger_b.call_count == 2
+        trigger_a.assert_not_called()
+        query.assert_called_once()
+        assert parent.retry is retry
+        assert parent.received_wrong_cid_queue == []
+        assert not select.select([reader], [], [], 0)[0]
+        assert not select.select([peer], [], [], 0)[0]
+    finally:
+        peer.close()
+        await asyncio.gather(polling, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
 
 
 @pytest.fixture
