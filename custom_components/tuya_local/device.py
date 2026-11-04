@@ -7,7 +7,7 @@ import logging
 from asyncio.exceptions import CancelledError
 from selectors import EVENT_READ, DefaultSelector
 from threading import Lock, RLock
-from time import time
+from time import monotonic, time
 from weakref import WeakKeyDictionary
 
 import tinytuya
@@ -147,10 +147,31 @@ class _GatewayReceiver:
         decode = self.parent._decode_payload
 
         def decode_packet(payload):
-            packet = decode(payload)
-            if not isinstance(packet, dict) or not self.parent.raw_recv:
+            try:
+                packet = decode(payload)
+            except Exception as error:
+                frame = self.parent.raw_recv[-1] if self.parent.raw_recv else None
+                _ROUTING_LOGGER.debug(
+                    "Gateway decode failed cmd=%s seq=%s payload_bytes=%s error_type=%s",
+                    getattr(frame, "cmd", None),
+                    getattr(frame, "seqno", None),
+                    len(payload),
+                    type(error).__name__,
+                )
+                raise
+            if not self.parent.raw_recv:
                 return packet
             frame = self.parent.raw_recv[-1]
+            _ROUTING_LOGGER.debug(
+                "Gateway decoded cmd=%s seq=%s payload_bytes=%s result_type=%s json_keys=%s",
+                frame.cmd,
+                frame.seqno,
+                len(payload),
+                type(packet).__name__,
+                list(packet) if isinstance(packet, dict) else None,
+            )
+            if not isinstance(packet, dict):
+                return packet
             sent = self.parent.raw_sent
             # Some replies echo the request sequence (3.5 does not). Do not
             # use sequence equality to override the observed command-8,
@@ -175,6 +196,48 @@ class _GatewayReceiver:
             return func(*args)
         finally:
             self.parent._decode_payload = decode
+
+    def read_poll(self, func):
+        """Keep unrelated ACKs out of TinyTuya's limited poll-response retries.
+
+        The caller holds the shared lock. Ignore only successful empty
+        heartbeat/write ACKs, leaving data and the poll's own ACKs unchanged.
+        Full frames still use TinyTuya's normal socket timeout.
+        """
+        receive = self.parent._receive
+
+        def receive_reply_frame():
+            deadline = monotonic() + self.parent.connection_timeout
+            while True:
+                frame = receive()
+                if frame:
+                    _ROUTING_LOGGER.debug(
+                        "Gateway poll frame cmd=%s seq=%s retcode=%s payload_bytes=%s",
+                        frame.cmd,
+                        frame.seqno,
+                        frame.retcode,
+                        len(frame.payload),
+                    )
+                if (
+                    not frame
+                    or frame.payload
+                    or frame.retcode != 0
+                    or frame.cmd not in {CT.HEART_BEAT, CT.CONTROL, CT.CONTROL_NEW}
+                ):
+                    return frame
+                _ROUTING_LOGGER.debug(
+                    "Gateway poll skipped unrelated empty ACK cmd=%s seq=%s",
+                    frame.cmd,
+                    frame.seqno,
+                )
+                if monotonic() >= deadline:
+                    raise TimeoutError("Gateway poll received only unrelated ACKs")
+
+        self.parent._receive = receive_reply_frame
+        try:
+            return self.read(func)
+        finally:
+            self.parent._receive = receive
 
     @staticmethod
     def _is_child_report(packet, command):
@@ -1017,11 +1080,16 @@ class TuyaLocalDevice(object):
             persist = receiver.parent.socketPersistent
             receiver.parent.set_socketPersistent(True)
             try:
-                reply = receiver.read(func)
+                reply = receiver.read_poll(func)
+                _ROUTING_LOGGER.debug(
+                    "%s poll transaction result_type=%s",
+                    self.name,
+                    type(reply).__name__,
+                )
                 while receiver.is_child_push(reply):
                     deliveries.append((reply, "poll-interleaved"))
                     # Child receive() reads again without sending another request.
-                    reply = receiver.read(self._api.receive)
+                    reply = receiver.read_poll(self._api.receive)
                     if reply is None:
                         raise TimeoutError("Gateway poll reply missing after push")
                 return reply
