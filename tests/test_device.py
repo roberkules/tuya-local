@@ -3,6 +3,7 @@ import json
 import logging
 import socket
 from threading import Event as ThreadEvent
+from threading import get_ident
 from time import sleep as blocking_sleep
 from time import time
 from types import SimpleNamespace
@@ -1803,7 +1804,9 @@ async def test_gateway_scene_pushes_and_stale_poll_reply_share_transaction(
     gateway_read = mocker.spy(parent, "receive")
     polled = asyncio.Event()
     state = mocker.MagicMock()
-    state.on_receive.side_effect = lambda dps, _: polled.set() if "2" in dps else None
+    state.on_receive.side_effect = lambda dps, full: (
+        polled.set() if "2" in dps and full else None
+    )
     b._children.append(state)
     caplog.set_level(logging.DEBUG, logger="custom_components.tuya_local.device")
     loop_task = asyncio.create_task(b.receive_loop())
@@ -1860,7 +1863,7 @@ async def test_gateway_scene_pushes_and_stale_poll_reply_share_transaction(
         assert b.get_property("2") is True
         assert b._api_working_protocol_failures == 0
         assert parent._decode_payload == original_decode
-        assert "path=poll-interleaved source=push cmd=8 seq=0" in caplog.text
+        assert "path=decoded-push source=push cmd=8 seq=0" in caplog.text
         assert "received source=poll" in caplog.text
     finally:
         b._running = False
@@ -2001,13 +2004,16 @@ async def test_gateway_wrong_cid_queue_keeps_packet_origin_and_delivers_once(
         receiver.start(a)
         receiver.start(b)
         await asyncio.wait_for(delivered.wait(), 1)
+        async with asyncio.timeout(1):
+            while parent.received_wrong_cid_queue:
+                await asyncio.sleep(0)
         assert parent.received_wrong_cid_queue == []
         assert trigger_b.call_count == 2
         trigger_a.assert_not_called()
         assert b.get_property("2") is True
         receiver.dispatch(reply, "receive")  # Poll results are already claimed.
         assert "already delivered" in caplog.text
-        assert "path=cid-queue source=poll cmd=16" in caplog.text
+        assert "path=decoded-other source=poll cmd=16" in caplog.text
     finally:
         peer.close()
         await receiver.stop(a)
@@ -2216,12 +2222,15 @@ async def test_bseed_capture_queued_snapshot_and_two_identical_presses(
         receiver.start(a)
         receiver.start(b)
         await asyncio.wait_for(state_received.wait(), 1)
+        async with asyncio.timeout(1):
+            while parent.received_wrong_cid_queue:
+                await asyncio.sleep(0)
         trigger_b.assert_not_called()
         state.on_receive.assert_called_once_with(snapshot, True)
         assert handle.call_args_list == [mocker.call(snapshot, False, from_poll=True)]
         assert parent.received_wrong_cid_queue == []
         assert b.get_property("36") is True
-        assert "path=cid-queue source=poll cmd=16 seq=75729" in caplog.text
+        assert "path=decoded-other source=poll cmd=16 seq=75729" in caplog.text
 
         # 16:37:13: B's own status reply reaches the child receive_loop.
         b._running = True
@@ -2498,6 +2507,104 @@ async def test_concurrent_gateway_child_polls_preserve_ten_rapid_presses(
     finally:
         peer.close()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+@pytest.mark.parametrize("method", ["status", "updatedps"])
+@pytest.mark.parametrize("push_child", ["same", "other"])
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_reports_are_delivered_before_poll_completion(
+    transport_gateway, gateway_scene_events, mocker, method, push_child, timeout
+):
+    parent, a, b = transport_gateway
+    if timeout:
+        # Test delivery during one failed transaction; retry behaviour has
+        # separate coverage and must not open a real replacement connection.
+        b._SINGLE_PROTO_CONNECTION_ATTEMPTS = 1
+    trigger_a, trigger_b = gateway_scene_events
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(1)
+    peer.settimeout(1)
+    for device in (a, b):
+        device._cached_state = {"updated_at": time()}
+    child = b if push_child == "same" else a
+    trigger = trigger_b if push_child == "same" else trigger_a
+    unrelated = trigger_a if push_child == "same" else trigger_b
+    delivered = asyncio.Event()
+    callback_threads = []
+    main_thread = get_ident()
+
+    def event_received(*_):
+        callback_threads.append(get_ident())
+        if len(callback_threads) == 2:
+            delivered.set()
+
+    trigger.side_effect = event_received
+    query = mocker.spy(b._api, method)
+    gateway_read = mocker.spy(parent, "receive")
+    poll = b._api.status if method == "status" else lambda: b._api.updatedps([1, 24])
+    pending = asyncio.create_task(b._poll_with_gateway_pushes(poll, "poll failed"))
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        request = parent.raw_sent
+        receiver.start(a)
+        receiver.start(b)
+        # Even a report matching the query sequence must remain a genuine press.
+        peer.sendall(
+            gateway_frame(
+                parent, {"1": "scene"}, 4, cid=child.dev_cid, sequence=request.seqno
+            )
+            + gateway_frame(
+                parent,
+                {"1": "scene"},
+                4,
+                cid=child.dev_cid,
+                sequence=request.seqno + 1,
+            )
+        )
+        await asyncio.wait_for(delivered.wait(), 0.5)
+        assert receiver.lock.locked()
+        assert not pending.done()
+        gateway_read.assert_not_called()
+        assert callback_threads == [main_thread, main_thread]
+        unrelated.assert_not_called()
+        if not timeout:
+            peer.sendall(
+                gateway_frame(
+                    parent,
+                    {"1": "scene", "24": True},
+                    4,
+                    cid=b.dev_cid,
+                    command=request.cmd,
+                    sequence=request.seqno,
+                )
+            )
+        reply = await asyncio.wait_for(pending, 2)
+        if reply:
+            # The original poll reply refreshes state without generating a press.
+            b._handle_poll(reply["data"]["dps"], True, from_poll=True)
+        # Let the concurrent receiver drain TinyTuya's retained packet copies.
+        for _ in range(20):
+            if not parent.received_wrong_cid_queue:
+                break
+            await asyncio.sleep(0.01)
+        assert not parent.received_wrong_cid_queue
+        query.assert_called_once()
+        assert trigger.call_args_list == [
+            mocker.call("pressed", {"multi_press_count": None}),
+            mocker.call("pressed", {"multi_press_count": None}),
+        ]
+        unrelated.assert_not_called()
+    finally:
+        peer.close()
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
         await receiver.stop(a)
         await receiver.stop(b)
         reader.close()
