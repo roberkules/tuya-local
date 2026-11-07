@@ -156,7 +156,7 @@ class _GatewayReceiver:
             if not any(not d._poll_only for d in self.devices.values()):
                 self.parent.set_socketPersistent(False)
 
-    def read(self, func, *args):
+    def read(self, func, *args, poll_device=None):
         """Keep frame metadata before TinyTuya can queue a wrong-CID result.
 
         Called in the executor with the gateway lock held. TinyTuya 1.20
@@ -204,12 +204,24 @@ class _GatewayReceiver:
                 and frame.seqno == sent.seqno
                 and not self._is_child_report(packet, frame.cmd)
             )
-            return _GatewayPacket(
+            packet = _GatewayPacket(
                 packet,
                 frame.cmd,
                 frame.seqno,
                 frame.cmd == CT.STATUS and not poll_reply,
             )
+            data = packet.get("data", packet)
+            cid = data.get("cid", packet.get("cid")) if isinstance(data, dict) else None
+            report = self._is_child_report(packet, frame.cmd)
+            if report or (poll_device and cid and cid != poll_device.dev_cid):
+                # TinyTuya may keep this packet in its wrong-CID queue while
+                # waiting for a poll reply. Deliver it on the HA loop now,
+                # without releasing socket ownership. The same packet's
+                # delivered flag prevents later queue/return-path duplicates.
+                self.hass.loop.call_soon_threadsafe(
+                    self.dispatch, packet, "decoded-push" if report else "decoded-other"
+                )
+            return packet
 
         self.parent._decode_payload = decode_packet
         try:
@@ -217,7 +229,7 @@ class _GatewayReceiver:
         finally:
             self.parent._decode_payload = decode
 
-    def read_poll(self, func):
+    def read_poll(self, func, *, poll_device=None):
         """Keep unrelated ACKs out of TinyTuya's limited poll-response retries.
 
         The caller holds the shared lock. Ignore only successful empty
@@ -255,7 +267,7 @@ class _GatewayReceiver:
 
         self.parent._receive = receive_reply_frame
         try:
-            return self.read(func)
+            return self.read(func, poll_device=poll_device)
         finally:
             self.parent._receive = receive
 
@@ -1114,12 +1126,15 @@ class TuyaLocalDevice(object):
             while receiver.parent.received_wrong_cid_queue:
                 _, packet = receiver.parent.received_wrong_cid_queue.pop(0)
                 deliveries.append((packet, "cid-queue"))
+                self._hass.loop.call_soon_threadsafe(
+                    receiver.dispatch, packet, "cid-queue"
+                )
             # TinyTuya closes a nonpersistent socket before returning each
             # packet, including a push that arrived ahead of the poll reply.
             persist = receiver.parent.socketPersistent
             receiver.parent.set_socketPersistent(True)
             try:
-                reply = receiver.read_poll(func)
+                reply = receiver.read_poll(func, poll_device=self)
                 _ROUTING_LOGGER.debug(
                     "%s poll transaction result_type=%s",
                     self.name,
@@ -1128,7 +1143,7 @@ class TuyaLocalDevice(object):
                 while receiver.is_child_push(reply):
                     deliveries.append((reply, "poll-interleaved"))
                     # Child receive() reads again without sending another request.
-                    reply = receiver.read_poll(self._api.receive)
+                    reply = receiver.read_poll(self._api.receive, poll_device=self)
                     if reply is None:
                         raise TimeoutError("Gateway poll reply missing after push")
                 return reply
