@@ -277,6 +277,196 @@ def mock_api(mocker):
     yield mock
 
 
+@pytest.mark.parametrize("method", ["status", "updatedps"])
+@pytest.mark.parametrize("command", [CT.DP_QUERY_NEW, CT.UPDATEDPS])
+@pytest.mark.parametrize("push_first", [False, True])
+@pytest.mark.parametrize("push_child", ["same", "other"])
+async def test_gateway_rejected_query_keeps_reports_and_connection(
+    transport_gateway,
+    gateway_scene_events,
+    mocker,
+    method,
+    command,
+    push_first,
+    push_child,
+    caplog,
+):
+    """A CID-less negative query response completes promptly, without a retry."""
+    parent, a, b = transport_gateway
+    trigger_a, trigger_b = gateway_scene_events
+    child = a if push_child == "same" else b
+    trigger = trigger_a if push_child == "same" else trigger_b
+    unrelated = trigger_b if push_child == "same" else trigger_a
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(2)
+    peer.settimeout(1)
+    process = parent._process_message
+    query = mocker.spy(a._api, method)
+    delivered = asyncio.Event()
+    trigger.side_effect = lambda *_: (
+        delivered.set() if trigger.call_count == 2 else None
+    )
+    # Only command, return code, encrypted size and lack of CID reproduce the
+    # hardware error. Its exact plaintext is unknown and remains synthetic.
+    payload = AESCipher(parent.local_key).encrypt(b"synthetic query error", False)
+    assert len(payload) == 32
+    rejected = pack_message(
+        TuyaMessage(218440, command, 1, (1).to_bytes(4, "big") + payload, 0),
+        hmac_key=parent.local_key,
+    )
+    first = gateway_frame(parent, {"1": "scene"}, 4, sequence=218441, cid=child.dev_cid)
+    second = gateway_frame(
+        parent, {"1": "scene"}, 4, sequence=218442, cid=child.dev_cid
+    )
+    stale = gateway_frame(
+        parent,
+        {"1": "scene", "24": False},
+        command=CT.DP_QUERY_NEW,
+        nested=False,
+        cid=child.dev_cid,
+    )
+    poll = a._api.status if method == "status" else lambda: a._api.updatedps([24])
+    pending = asyncio.create_task(a._poll_with_gateway_pushes(poll, "poll failed"))
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        receiver.start(a)
+        receiver.start(b)
+        with caplog.at_level(
+            logging.DEBUG, logger="custom_components.tuya_local.device.routing"
+        ):
+            peer.sendall(
+                (first + rejected if push_first else rejected + first) + stale + second
+            )
+            assert await asyncio.wait_for(pending, 0.5) is None
+            await asyncio.wait_for(delivered.wait(), 1)
+        query.assert_called_once()
+        unrelated.assert_not_called()
+        assert trigger.call_args_list == [
+            mocker.call("pressed", {"multi_press_count": None}),
+            mocker.call("pressed", {"multi_press_count": None}),
+        ]
+        assert parent._process_message == process
+        assert parent.socket is reader
+        assert parent.socketPersistent
+        assert a._api_working_protocol_failures == 0
+        assert "Gateway query rejected" in caplog.text
+        assert "synthetic query error" not in caplog.text
+    finally:
+        peer.close()
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
+@pytest.mark.parametrize("updatedps", [False, True])
+async def test_gateway_empty_poll_waits_before_retrying_stale_cache(
+    transport_gateway, mocker, updatedps
+):
+    """A failed poll must not turn a stale cache into a 0.1-second retry loop."""
+    parent, _, b = transport_gateway
+    clock = [1000.0]
+    attempts = []
+    parent.socket = mocker.MagicMock()
+    b._cached_state = {"24": False, "updated_at": 1}
+    b._last_full_poll = 0
+    b._running = True
+    if updatedps:
+        b._force_dps = [24]
+    mocker.patch(
+        "custom_components.tuya_local.device.time", side_effect=lambda: clock[0]
+    )
+    mocker.patch.object(b, "_async_set_socket_persistent", new=mocker.AsyncMock())
+    mocker.patch.object(b._api, "heartbeat", return_value=None)
+
+    async def poll(*_):
+        attempts.append(clock[0])
+        return None if len(attempts) == 1 else {"dps": {"24": True}}
+
+    async def idle(_):
+        clock[0] += 1
+
+    mocker.patch.object(b, "_poll_with_gateway_pushes", side_effect=poll)
+    mocker.patch("custom_components.tuya_local.device.asyncio.sleep", side_effect=idle)
+    receive = b.async_receive()
+    try:
+        result = await receive.__anext__()
+        assert attempts == [1000.0, 1030.0]
+        assert b._cached_state == {"24": False, "updated_at": 1}
+        assert result["24"] is True
+        assert b._POLLING_INTERVAL == 30
+    finally:
+        b._running = False
+        await receive.aclose()
+
+
+def test_gateway_poll_error_hook_is_restored_after_exception(transport_gateway):
+    parent, _, b = transport_gateway
+    process = parent._process_message
+    decode = parent._decode_payload
+
+    def fail():
+        raise ValueError("failed poll")
+
+    with pytest.raises(ValueError, match="failed poll"):
+        b._gateway_receiver.read_poll_response(fail)
+    assert parent._process_message == process
+    assert parent._decode_payload == decode
+
+
+@pytest.mark.parametrize("method", ["status", "updatedps"])
+async def test_gateway_rejected_query_releases_waiting_child_write(
+    transport_gateway, gateway_scene_events, mocker, method
+):
+    """A negative reply cannot impose the socket timeout on another relay."""
+    parent, a, b = transport_gateway
+    receiver = b._gateway_receiver
+    reader, peer = socket.socketpair()
+    parent.socket = reader
+    parent.set_socketPersistent(True)
+    parent.set_socketTimeout(2)
+    peer.settimeout(1)
+    query = mocker.spy(a._api, method)
+    poll = a._api.status if method == "status" else lambda: a._api.updatedps([24])
+    pending = asyncio.create_task(a._poll_with_gateway_pushes(poll, "poll failed"))
+    write = None
+    try:
+        assert await asyncio.to_thread(peer.recv, 4096)
+        write = asyncio.create_task(b.async_set_property("24", True))
+        await asyncio.sleep(0)
+        assert receiver.lock.locked()
+        assert not write.done()
+        payload = AESCipher(parent.local_key).encrypt(b"synthetic query error", False)
+        peer.sendall(
+            pack_message(
+                TuyaMessage(
+                    218440, CT.DP_QUERY_NEW, 1, (1).to_bytes(4, "big") + payload, 0
+                ),
+                hmac_key=parent.local_key,
+            )
+        )
+        assert await asyncio.wait_for(pending, 0.5) is None
+        await asyncio.wait_for(write, 0.5)
+        assert await asyncio.to_thread(peer.recv, 4096)
+        assert parent.raw_sent.cmd == CT.CONTROL_NEW
+        assert parent.socket is reader
+        query.assert_called_once()
+    finally:
+        peer.close()
+        for task in (pending, write):
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await receiver.stop(a)
+        await receiver.stop(b)
+        reader.close()
+
+
 @pytest.fixture
 def patched_hass(hass, mocker):
     hass.is_running = True
