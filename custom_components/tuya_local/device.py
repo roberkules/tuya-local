@@ -176,6 +176,42 @@ class _GatewayReceiver:
         finally:
             self.parent._decode_payload = decode
 
+    def read_poll_response(self, func):
+        """Finish an explicit query rejection without waiting for a child CID.
+
+        TinyTuya routes CID-less error bodies through its wrong-CID queue and
+        waits again. A nonzero query reply is already the terminal response to
+        the single outstanding query; it cannot supply usable child state.
+        Leave the persistent connection open for following reports and writes.
+        Empty ACKs and all non-query commands retain TinyTuya's normal handling.
+        """
+        process = self.parent._process_message
+        self._poll_rejected = False
+
+        def process_reply(message, *args, **kwargs):
+            if (
+                message
+                and message.payload
+                and message.retcode != 0
+                and message.cmd in {CT.DP_QUERY, CT.DP_QUERY_NEW, CT.UPDATEDPS}
+            ):
+                _ROUTING_LOGGER.debug(
+                    "Gateway query rejected cmd=%s seq=%s retcode=%s payload_bytes=%s",
+                    message.cmd,
+                    message.seqno,
+                    message.retcode,
+                    len(message.payload),
+                )
+                self._poll_rejected = True
+                return None
+            return process(message, *args, **kwargs)
+
+        self.parent._process_message = process_reply
+        try:
+            return self.read(func)
+        finally:
+            self.parent._process_message = process
+
     @staticmethod
     def _is_child_report(packet, command):
         """Require a STATUS frame with the captured child-report JSON shape."""
@@ -645,6 +681,7 @@ class TuyaLocalDevice(object):
         # flag to alternate updatedps and status calls to ensure we get
         # all dps updated
         dps_updated = False
+        next_poll_attempt = 0
 
         await self._async_set_socket_persistent(persist)
 
@@ -673,8 +710,9 @@ class TuyaLocalDevice(object):
                     self._last_full_poll = 0  # ensure we start with a full poll
 
                 needs_full_poll = now - self._last_full_poll > self._POLLING_INTERVAL
-                if now - last_cache > self._POLLING_INTERVAL or (
-                    persist and needs_full_poll
+                if now >= next_poll_attempt and (
+                    now - last_cache > self._POLLING_INTERVAL
+                    or (persist and needs_full_poll)
                 ):
                     from_poll = True
                     if (
@@ -696,6 +734,20 @@ class TuyaLocalDevice(object):
                         full_poll = True
                     self._last_full_poll = now
                     last_heartbeat = now  # reset heartbeat timer on full poll
+                    # A missing gateway reply leaves the cache stale. Do not
+                    # let that stale-cache condition immediately send another
+                    # query and monopolise healthy siblings' connection.
+                    next_poll_attempt = (
+                        time() + self._POLLING_INTERVAL
+                        if self._gateway_receiver and not poll
+                        else 0
+                    )
+                    if next_poll_attempt:
+                        _ROUTING_LOGGER.debug(
+                            "%s gateway poll returned no state; retry in %s seconds",
+                            self.name,
+                            self._POLLING_INTERVAL,
+                        )
                 elif persist:
                     if now - last_heartbeat > self._HEARTBEAT_INTERVAL:
                         if self._gateway_receiver:
@@ -1017,12 +1069,12 @@ class TuyaLocalDevice(object):
             persist = receiver.parent.socketPersistent
             receiver.parent.set_socketPersistent(True)
             try:
-                reply = receiver.read(func)
+                reply = receiver.read_poll_response(func)
                 while receiver.is_child_push(reply):
                     deliveries.append((reply, "poll-interleaved"))
                     # Child receive() reads again without sending another request.
-                    reply = receiver.read(self._api.receive)
-                    if reply is None:
+                    reply = receiver.read_poll_response(self._api.receive)
+                    if reply is None and not receiver._poll_rejected:
                         raise TimeoutError("Gateway poll reply missing after push")
                 return reply
             except Exception:
