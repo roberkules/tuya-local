@@ -2439,9 +2439,11 @@ async def test_gateway_wrong_cid_queue_keeps_packet_origin_and_delivers_once(
         assert "already delivered" in caplog.text
         assert "path=decoded-other source=poll cmd=16" in caplog.text
     finally:
-        peer.close()
+        # Keep the connection open until the receiver stops. An early EOF can
+        # cause TinyTuya to attempt a real TCP reconnect during teardown.
         await receiver.stop(a)
         await receiver.stop(b)
+        peer.close()
         reader.close()
 
 
