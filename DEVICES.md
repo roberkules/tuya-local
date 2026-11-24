@@ -18,6 +18,7 @@
 - BVF CP1 heater
 - Caldo Up T fan heater
 - Calex Smart Convector heater
+- Castle Heaters NR series heater
 - Cecotec ReadyWarm 8400 Fan and 2000 Max Box Ceramic heaters
 - Cixi Jemell PTC-1919 PTC heater
 - Cleverio AR10/AR20 panel heaters
@@ -289,7 +290,7 @@
 - Beca BHT-12 thermostat smartplug
 - Beok TCB/W38 thermostat (also sold as RT-70 under other brands)
 - Beok TGR81 thermostat _(also reported working with Myuet ME98, Avatto WT81/ME81)_
-- Beok SH-TGM50-WP, TGM50, TOL47, TR8B thermostats
+- Beok SH-TGM50-WP, TGM50, TOL47, TR8B, TCC31  thermostats
 - Beok TR9B _(rebadged as Vancoo and perhaps others)_, TR9B-AC2 thermostats
 - BHT-002-GALW and GABW thermostats _(rebadged as many different brands)_
 - Brade MC6 thermostat _(rebadged as many different brands)_
@@ -515,6 +516,7 @@
 - Cleverio AP100 air purifier
 - ComfortZone AP100 air purifier
 - Dayette AP409 air purifier
+- Djive Flowmate ARC Casual purifiying fan
 - Duux Bright air purifier
 - essentials portable air purifier
 - Himox H05 and H06 air purifiers
@@ -675,6 +677,7 @@
 - Casdon KG1 inline water dispenser
 - Casdon TD Pro 2, TD Pro 3 and T2E ovens
 - Cecofry 5500 Connected air fryer
+- Dunavox DVS-25.65 wine cooler
 - EA dual zone car fridge
 - Etna VW644MC dishwasher, AB791 range hood
 - Fiesta DK-1G smart kettle
@@ -736,6 +739,7 @@
 - Ketotek KTEM06pro energy meter
 - MatSee Plus bidirectional two channel clamp meter (multiple variants)
 - Meterk single phase clamp meter
+- MTY2 energy monitoring circuit breaker
 - Ourtop ATMS100133 energy meter
 - Owon PC341 3 in 16 out clamp energy meter
 - Parkside PG/PMW-300 solar inverter
@@ -963,6 +967,7 @@ of device.
 - Brilliant Smart PIR outdoor sensor light switch
 - Brizlabs string lights
 - Calex S45 Clear E27 lightbulb
+- Cloudy Bay LFMC815SMWH dual-zone RGB+CCT ceiling light
 - Deltaco LED Strip (SH-LW5M)
 - Deta/Arlec motion sensor lights (DET100HA/DET102HA/MAL315HA)
 - Deta 6910HA series2 dimmer switch
@@ -1089,6 +1094,7 @@ of device.
 - Moes SCS80 Touch curtain switch with backlight and timing control
 - Moes WS-USR-2C double curtain switch with backlight
 - Moes WS-Y-EUC curtain switch with backlight and timing control
+- Novo Q1-3E-1.2 vertical blinds
 - Outdoor Inc zip blind
 - QS-WIFI-C01(BK) curtain module
 - QS-WIFI-C02 dual curtain module
@@ -1273,6 +1279,7 @@ port and password.
 - iPettie W5 and FW54 pet feeders
 - Kalado KPF01 pet feeder
 - Kanchou pet fountain
+- Kogan F28W pet feeder
 - Leo's Loo Too pet toilet
 - Littepets MA2 series Cute Baby cat litter box
 - LSC Smart Connect pet feeder
@@ -1425,6 +1432,7 @@ port and password.
 - Manta Windy MT0200B weather station
 - Mayborn GroClock Connect sleep training alarm clock (also sold under Tommee Tippee and other brands)
 - ME201W level sensor
+- MG2-6HW breathing mmWave radar
 - Mirabella Genio motion sensor
 - Moes human presence sensor
 - Moes single outlet water timer
@@ -1556,7 +1564,8 @@ entity types as sub devices.
 - Avatto TRV06 radiator valve (also sold branded as Thaleos)
 - Avatto ZWT198 thermostat
 - Beok BAC-009 smart knob thermostat
-- Generic Zigbee Door Sensor
+- Door Sensor
+- Ekaza EKAV-T229Z door lock
 - Haozee RB-SRAIN01 solar rain sensor
 - Haozee ZG-302ZM mmWave presence dual light switch
 - Intelbras IFR7000 door lock

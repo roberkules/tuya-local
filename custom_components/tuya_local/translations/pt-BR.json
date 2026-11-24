@@ -156,6 +156,7 @@
                             "chamber_low_temperature": "Temperatura baixa da câmara",
                             "chamber_overheat": "Superaquecimento da câmara",
                             "communication_error": "Erro de comunicação",
+                            "door_open": "Porta aberta",
                             "drain_blocked": "Bloqueio de drenagem",
                             "evaporation_tray_low_temperature": "Temperatura baixa da bandeja de evaporação",
                             "evaporation_tray_overheat": "Superaquecimento da bandeja de evaporação",
@@ -163,6 +164,8 @@
                             "firewall_sensor_fault": "Falha do sensor de firewall",
                             "gas_leak": "Vazamento de gás",
                             "heating_fault": "Falha de aquecimento",
+                            "high_temperature": "Alta temperatura",
+                            "low_temperature": "Baixa temperatura",
                             "no_water": "Sem água",
                             "ok": "OK",
                             "overflow": "Transbordamento",
@@ -451,6 +454,7 @@
                             "medium": "Médio",
                             "high": "Alto",
                             "strong": "Forte",
+                            "fresh": "Fresco",
                             "displayoff": "Exibição desligada"
                         }
                     }
@@ -704,6 +708,13 @@
                     "slovak": "Slovenčina",
                     "thai": "ไทย",
                     "vietnamese": "Tiếng Việt",
+                    "english_au": "English (Australia)",
+                    "english_ca": "English (Canada)",
+                    "english_in": "English (India)",
+                    "english_us": "English (United States)",
+                    "french_ca": "Français (Canada)",
+                    "hindi": "हिंदी",
+                    "spanish_us": "Español (Estados Unidos)",
                     "off": "Desligado"
                 }
             },
@@ -724,7 +735,11 @@
                     "custom": "Personalizado",
                     "mode_1": "Modo 1",
                     "mode_2": "Modo 2",
-                    "mode_3": "Modo 3"
+                    "mode_3": "Modo 3",
+                    "door": "Porta",
+                    "24h": "24 horas",
+                    "30m": "30 minutos",
+                    "1m": "1 minuto"
                 }
             },
             "mopping": {

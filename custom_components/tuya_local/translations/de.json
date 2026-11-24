@@ -156,6 +156,7 @@
                             "chamber_low_temperature": "Kammer Niedertemperaturschutz",
                             "chamber_overheat": "Kammer Überhitzungsschutz",
                             "communication_error": "Kommunikationsfehler",
+                            "door_open": "Tür offen",
                             "drain_blocked": "Abfluss blockiert",
                             "evaporation_tray_low_temperature": "Verdunstungsschale Niedertemperaturschutz",
                             "evaporation_tray_overheat": "Verdunstungsschale Überhitzungsschutz",
@@ -163,6 +164,8 @@
                             "firewall_sensor_fault": "Firewall-Sensorfehler",
                             "gas_leak": "Gasleck",
                             "heating_fault": "Heizungsfehler",
+                            "high_temperature": "Hohe Temperatur",
+                            "low_temperature": "Niedrige Temperatur",
                             "no_water": "Kein Wasser",
                             "ok": "OK",
                             "overflow": "Überlauf",
@@ -451,6 +454,7 @@
                             "medium": "Mittel",
                             "high": "Hoch",
                             "strong": "Stark",
+                            "fresh": "Frisch",
                             "displayoff": "Anzeige aus"
                         }
                     }
@@ -704,6 +708,13 @@
                     "slovak": "Slovenčina",
                     "thai": "ไทย",
                     "vietnamese": "Tiếng Việt",
+                    "english_au": "English (Australia)",
+                    "english_ca": "English (Canada)",
+                    "english_in": "English (India)",
+                    "english_us": "English (United States)",
+                    "french_ca": "Français (Canada)",
+                    "hindi": "हिंदी",
+                    "spanish_us": "Español (Estados Unidos)",
                     "off": "Aus"
                 }
             },
@@ -724,7 +735,11 @@
                     "custom": "Benutzerdefiniert",
                     "mode_1": "Modus 1",
                     "mode_2": "Modus 2",
-                    "mode_3": "Modus 3"
+                    "mode_3": "Modus 3",
+                    "door": "Tür",
+                    "24h": "24 Stunden",
+                    "30m": "30 Minuten",
+                    "1m": "1 Minute"
                 }
             },
             "mopping": {
